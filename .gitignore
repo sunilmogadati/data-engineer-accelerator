@@ -3,13 +3,14 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Data files
-*.csv
-*.json
+# Data files (global — prevent accidental large file commits)
 *.parquet
 *.avro
 *.db
-data/
+
+# Allow synthetic training dataset (small, no real data)
+# data/ directory is tracked — contains calls.json, orders.csv, etc.
+# These are intentionally included so students can clone and run labs immediately
 
 # Credentials
 .env

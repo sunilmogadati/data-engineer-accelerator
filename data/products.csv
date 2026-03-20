@@ -1,0 +1,21 @@
+sku,description,base_price,category,is_upsell,is_upgrade
+SKU-100,Premium Wireless Headphones,49.99,electronics,N,N
+SKU-101,Noise Canceling Earbuds,79.99,electronics,N,Y
+SKU-102,Bluetooth Speaker,39.99,electronics,N,N
+SKU-103,Wireless Charging Pad,24.99,electronics,Y,N
+SKU-200,Vitamin D3 Supplement 90ct,29.99,health,N,N
+SKU-201,Multivitamin 120ct,34.99,health,N,N
+SKU-202,Omega-3 Fish Oil 60ct,24.99,health,Y,N
+SKU-203,Probiotic 30ct,39.99,health,N,N
+SKU-204,Premium Multivitamin 120ct,49.99,health,N,Y
+SKU-300,Skin Care Starter Kit,59.99,beauty,N,N
+SKU-301,Anti-Aging Serum,44.99,beauty,Y,N
+SKU-302,Moisturizer SPF 30,29.99,beauty,N,N
+SKU-303,Premium Skin Care Bundle,89.99,beauty,N,Y
+SKU-400,Home Security Camera,69.99,home,N,N
+SKU-401,Smart Doorbell,49.99,home,Y,N
+SKU-402,Security System Bundle,149.99,home,N,Y
+SKU-500,Fitness Tracker,59.99,fitness,N,N
+SKU-501,Smart Watch,99.99,fitness,N,Y
+SKU-502,Extra Watch Band,14.99,fitness,Y,N
+SKU-503,Heart Rate Monitor Chest Strap,34.99,fitness,Y,N
