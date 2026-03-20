@@ -16,6 +16,9 @@ data/
 *.pem
 service-account-*.json
 
+# Planning docs (internal, not student-facing)
+CURRICULUM_MASTER.md
+
 # OS
 .DS_Store
 Thumbs.db
