@@ -22,22 +22,28 @@ The "before and after" is the point. Same data. Same question. Wildly different 
 ## Step 1: Upload Raw Data to GCS
 
 ```bash
-# Set your project (replace with your GCP project ID)
+# GCP setup (one-time — skip if already done)
+# Install Google Cloud CLI: https://cloud.google.com/sdk/docs/install
+gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
+gcloud services enable bigquery.googleapis.com
+gcloud services enable storage.googleapis.com
 
 # Create a bucket (bucket names are globally unique — add your initials or a random suffix)
-gsutil mb -l us-central1 gs://de-accelerator-YOUR_NAME/
+gcloud storage buckets create gs://de-accelerator-YOUR_NAME/ --location=us-central1
 
 # Upload the call center data files
-gsutil cp data/calls.json gs://de-accelerator-YOUR_NAME/bronze/
-gsutil cp data/campaigns.csv gs://de-accelerator-YOUR_NAME/bronze/
-gsutil cp data/orders.csv gs://de-accelerator-YOUR_NAME/bronze/
-gsutil cp data/products.csv gs://de-accelerator-YOUR_NAME/bronze/
-gsutil cp data/payments.xml gs://de-accelerator-YOUR_NAME/bronze/
+gcloud storage cp data/calls.json gs://de-accelerator-YOUR_NAME/bronze/
+gcloud storage cp data/campaigns.csv gs://de-accelerator-YOUR_NAME/bronze/
+gcloud storage cp data/orders.csv gs://de-accelerator-YOUR_NAME/bronze/
+gcloud storage cp data/products.csv gs://de-accelerator-YOUR_NAME/bronze/
+gcloud storage cp data/payments.xml gs://de-accelerator-YOUR_NAME/bronze/
 
 # Verify
-gsutil ls gs://de-accelerator-YOUR_NAME/bronze/
+gcloud storage ls gs://de-accelerator-YOUR_NAME/bronze/
 ```
+
+> **Note:** `gcloud storage` is the current CLI. Older tutorials use `gsutil` — same functionality, `gcloud storage` is the replacement. Both work today.
 
 **Expected output:**
 ```
