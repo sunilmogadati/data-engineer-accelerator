@@ -9,11 +9,14 @@
 ```mermaid
 graph TD
     subgraph "SOURCE SYSTEMS"
-        S1["VA Platform<br/>(JSON via API)"]
+        S1["VA Platform<br/>(JSON via API/Webhook)"]
         S2["Call Management<br/>(SQL Server)"]
         S3["Order System<br/>(SQL Server)"]
         S4["Payment Gateway<br/>(API)"]
         S5["Phone Config<br/>(SQL Server)"]
+        S6["NoSQL Database<br/>(MongoDB)"]
+        S7["Application Logs<br/>(IIS, Node.js, etc.)"]
+        S8["Vendor Files<br/>(CSV via SFTP/Email)"]
     end
 
     subgraph "STEP 1: INGEST → Bronze (GCS)"
@@ -22,6 +25,9 @@ graph TD
         S3 -->|"Scheduled extract"| B3["gs://bucket/bronze/<br/>orders/"]
         S4 -->|"API pull"| B4["gs://bucket/bronze/<br/>payments/"]
         S5 -->|"Scheduled extract"| B5["gs://bucket/bronze/<br/>dnis_sources/"]
+        S6 -->|"mongoexport or<br/>Change Stream"| B6["gs://bucket/bronze/<br/>call_details/"]
+        S7 -->|"Cloud Logging sink<br/>or file copy"| B7["gs://bucket/bronze/<br/>logs/"]
+        S8 -->|"SFTP → GCS<br/>or Transfer Service"| B8["gs://bucket/bronze/<br/>vendor_files/"]
     end
 
     subgraph "STEP 2: CLEAN → Silver (BigQuery)"
@@ -80,18 +86,135 @@ gs://call-center-pipeline/
       2026-04-03/orders_20260403.csv
     payments/
       2026-04-03/payments_20260403.csv
+    call_details/
+      2026-04-03/call_details_20260403.json   ← Daily mongoexport from MongoDB
+    logs/
+      2026-04-03/app_logs_20260403.jsonl      ← Application logs (JSON lines)
+    vendor_files/
+      media_reports/
+        2026-04-03/mediabuy_report_20260403.csv  ← Vendor CSV (uploaded via SFTP or Transfer Service)
     dnis_sources/
       dnis_sources_latest.csv                  ← Config table — overwritten, not partitioned by date
 ```
 
 ### How Data Gets Into Bronze
 
-| Source | Ingestion Method | GCP Service | Trigger |
-|:---|:---|:---|:---|
-| **VA Platform** (real-time, JSON via webhook) | Webhook hits a Cloud Function that writes to GCS | **Cloud Functions** | Event: VA platform sends `call_analyzed` webhook |
-| **SQL Server tables** (batch, scheduled) | Extract query dumps CSV to GCS | **Dataflow** (managed Apache Beam) or **Cloud Function** with SQL connector | Schedule: Cloud Scheduler triggers at 2 AM daily |
-| **API sources** (payments, third-party) | Cloud Function calls API, writes response to GCS | **Cloud Functions** | Schedule: Cloud Scheduler |
-| **Config/lookup tables** (DNIS mapping) | Full extract — small table, overwrite daily | **Cloud Function** or manual upload | Schedule or on-change |
+| Source | Format | Ingestion Method | GCP Service | Trigger |
+|:---|:---|:---|:---|:---|
+| **VA Platform** (real-time) | JSON via webhook | Webhook hits a Cloud Function that writes to GCS | **Cloud Functions** | Event: VA platform sends `call_analyzed` webhook |
+| **SQL Server tables** (batch) | CSV extract | Extract query dumps CSV to GCS | **Dataflow** or **Cloud Function** with SQL connector | Schedule: Cloud Scheduler at 2 AM daily |
+| **API sources** (payments, third-party) | JSON via REST | Cloud Function calls API, writes response to GCS | **Cloud Functions** | Schedule: Cloud Scheduler |
+| **MongoDB** (NoSQL) | JSON (nested documents) | `mongoexport` to JSON file → upload to GCS. Or use MongoDB **Change Streams** for real-time CDC (Change Data Capture) → Cloud Function → GCS | **Cloud Functions** or **Dataflow** (for streaming) | Schedule (batch) or Change Stream event (real-time) |
+| **Application Logs** (IIS, Node.js, Python) | JSON lines, plain text | **Cloud Logging** collects logs automatically from GCP services. For non-GCP servers: install the Logging agent, or write logs to files and copy to GCS via cron. | **Cloud Logging** + **Log Sink** (routes logs to GCS/BigQuery) | Continuous (streaming) or schedule (batch file copy) |
+| **Vendor CSV files** (media reports, invoices) | CSV via email or SFTP | Multiple options (see below) | **Transfer Service** or **SFTP-to-GCS gateway** | On file arrival or schedule |
+| **Config/lookup tables** (DNIS mapping) | CSV | Full extract — small table, overwrite daily | **Cloud Function** or manual upload | Schedule or on-change |
+
+### How Vendor CSV Files Get Into GCS
+
+Vendors (media buyers, fulfillment companies, partners) send CSV files. They are not going to use `gcloud` CLI or the GCP Console. Common patterns:
+
+| Pattern | How It Works | When to Use |
+|:---|:---|:---|
+| **SFTP Gateway → GCS** | Set up an SFTP server (e.g., on a small VM or using a managed service). Vendor uploads via SFTP (they already know how). A cron job or Cloud Function moves files from the SFTP server to GCS. | Vendor is technical enough for SFTP. Most common in enterprise. |
+| **Storage Transfer Service** | GCP's built-in service that copies files from an SFTP server, S3 bucket, HTTP endpoint, or another GCS bucket into your bucket — on a schedule. No code needed. | Vendor has their own server/S3 and you pull from them on schedule. |
+| **Email attachment → Cloud Function** | Vendor emails the CSV. A Cloud Function triggered by Gmail/Pub/Sub (via an email integration) parses the attachment and uploads to GCS. | Small vendors who can only email. Less reliable — attachments can be malformed. |
+| **Signed URL upload** | Generate a time-limited URL that allows upload to a specific GCS path without GCP credentials. Send the URL to the vendor. They upload via browser or `curl`. | One-off uploads. Vendor needs no GCP account. |
+| **Partner Portal (web UI)** | Build a simple web page (Cloud Run + FastAPI) with a file upload form. Vendor logs in, uploads CSV, it goes straight to GCS. | Multiple vendors uploading regularly. Best user experience. |
+| **Google Drive → GCS** | Vendor drops file in a shared Google Drive folder. A Cloud Function syncs Drive → GCS on a schedule. | Very non-technical vendors. Consumer-grade but works. |
+
+**Console UI:** Storage Transfer Service
+1. Go to [console.cloud.google.com/transfer](https://console.cloud.google.com/transfer)
+2. **Create Transfer Job** → Source: SFTP server (or S3, or HTTP) → Destination: your GCS bucket → Schedule → **Create**
+
+**CLI: Generate a Signed URL for Vendor Upload**
+```bash
+# Generate a URL that allows upload for 1 hour — no GCP credentials needed
+gcloud storage sign-url gs://call-center-pipeline/bronze/vendor_files/media_report.csv \
+    --duration=1h --http-verb=PUT
+# Send this URL to the vendor. They upload with:
+# curl -X PUT -T their_file.csv "THE_SIGNED_URL"
+```
+
+### MongoDB Ingestion Details
+
+MongoDB stores documents as nested JSON — not flat rows. A single call record in MongoDB might look like:
+
+```json
+{
+  "call_id": "CALL-001",
+  "customer": {
+    "name": "Jane Doe",
+    "address": { "city": "Austin", "state": "TX" }
+  },
+  "products": [
+    {"sku": "SP-STD", "qty": 1, "price": 59.99},
+    {"sku": "SP-CASE", "qty": 1, "price": 19.99}
+  ]
+}
+```
+
+**Batch ingestion (simple):**
+```bash
+# Export from MongoDB to a JSON file
+mongoexport --uri="mongodb://host:27017/callcenter" \
+    --collection=calls \
+    --out=calls_export.json \
+    --jsonArray
+
+# Upload to GCS
+gcloud storage cp calls_export.json gs://call-center-pipeline/bronze/call_details/2026-04-03/
+```
+
+**Real-time ingestion (advanced — CDC with Change Streams):**
+MongoDB **Change Streams** emit an event every time a document is inserted, updated, or deleted. A listener (Cloud Function or Dataflow) captures each event and writes it to GCS or directly to BigQuery.
+
+```python
+# Simplified Change Stream listener
+from pymongo import MongoClient
+from google.cloud import storage
+
+client = MongoClient("mongodb://host:27017")
+db = client.callcenter
+
+# Watch for new call records
+with db.calls.watch() as stream:
+    for change in stream:
+        if change["operationType"] == "insert":
+            doc = change["fullDocument"]
+            # Write to GCS
+            blob = bucket.blob(f"bronze/call_details/{doc['call_id']}.json")
+            blob.upload_from_string(json.dumps(doc))
+```
+
+**The flattening happens in Silver, not Bronze.** Bronze stores the nested JSON as-is. The Silver layer flattens `customer.address.city` into `customer_address_city` using `JSON_EXTRACT` in BigQuery or `pd.json_normalize()` in Python.
+
+### Application Log Ingestion
+
+Logs from web servers (IIS), application servers (Node.js, Python), and cloud services contain valuable data: error rates, response times, user actions, system events.
+
+**For GCP-hosted applications:**
+Cloud Logging collects logs automatically. Route them to GCS or BigQuery using a **Log Sink:**
+
+1. Go to [console.cloud.google.com/logs/router](https://console.cloud.google.com/logs/router)
+2. **Create Sink** → name: `logs-to-gcs` → Destination: GCS bucket → Filter: `resource.type="cloud_run_revision"` (or whatever you want) → **Create**
+3. Logs matching the filter are automatically exported to GCS
+
+**For non-GCP servers (on-premise, other cloud):**
+- Install the **Cloud Logging agent** (fluentd-based) on the server — it ships logs to Cloud Logging
+- Or write logs to files and use a cron job to copy them to GCS:
+  ```bash
+  # Cron: every hour, copy today's logs to GCS
+  0 * * * * gcloud storage cp /var/log/app/app.log gs://call-center-pipeline/bronze/logs/$(date +\%Y-\%m-\%d)/
+  ```
+
+**In BigQuery:** Logs exported to BigQuery can be queried directly:
+```sql
+-- Find all errors in the last hour
+SELECT timestamp, jsonPayload.message, jsonPayload.error
+FROM `project.logs.app_logs`
+WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+AND severity = 'ERROR';
+```
 
 ### GCP Console UI: Setting Up the Bucket
 
@@ -157,10 +280,12 @@ This fires every time a new file is uploaded to the bucket. The function checks 
 
 **Goal:** Load raw data from GCS into BigQuery, clean it, and produce a unified, deduplicated dataset.
 
-### Load Bronze Files into BigQuery Raw Tables
+### Two Ways to Access Bronze Data in BigQuery
+
+**Option A: Load into BigQuery (native tables)** — copies data from GCS into BigQuery storage. Fastest queries. Use for Silver/Gold layers and production reports.
 
 ```bash
-# Load from GCS into BigQuery raw tables (auto-detect schema)
+# Load from GCS into BigQuery native tables (auto-detect schema)
 bq load --autodetect --replace --source_format=NEWLINE_DELIMITED_JSON \
     raw.va_calls gs://call-center-pipeline/bronze/va_calls/2026-04-03/*.json
 
@@ -173,6 +298,76 @@ bq load --autodetect --replace --source_format=CSV \
 bq load --autodetect --replace --source_format=CSV \
     raw.dnis_sources gs://call-center-pipeline/bronze/dnis_sources/*.csv
 ```
+
+**Option B: External tables (query GCS directly)** — no copying. BigQuery reads from GCS at query time. Data stays in GCS. Like AWS Athena querying S3.
+
+```sql
+-- Create an external table pointing to GCS — no data copied
+CREATE OR REPLACE EXTERNAL TABLE raw.va_calls_external
+OPTIONS (
+    format = 'JSON',
+    uris = ['gs://call-center-pipeline/bronze/va_calls/2026-04-03/*.json']
+);
+
+-- Query it like any BigQuery table — reads from GCS on every query
+SELECT call_id, duration, disposition
+FROM raw.va_calls_external
+LIMIT 10;
+
+-- External table for CSV files
+CREATE OR REPLACE EXTERNAL TABLE raw.orders_external
+OPTIONS (
+    format = 'CSV',
+    uris = ['gs://call-center-pipeline/bronze/orders/2026-04-03/*.csv'],
+    skip_leading_rows = 1    -- skip the CSV header row
+);
+
+-- Wildcard: query ALL dates at once (scans all date folders)
+CREATE OR REPLACE EXTERNAL TABLE raw.va_calls_all_dates
+OPTIONS (
+    format = 'JSON',
+    uris = ['gs://call-center-pipeline/bronze/va_calls/*/*.json']
+);
+```
+
+**Console UI: Create External Table**
+1. BigQuery → `raw` dataset → **Create Table**
+2. Source: **Google Cloud Storage**
+3. URI: `gs://call-center-pipeline/bronze/va_calls/2026-04-03/*.json`
+4. File format: **JSON (Newline delimited)**
+5. **Table type: External table** (not the default "Native table")
+6. Auto-detect schema → **Create Table**
+7. Click the table → **Preview** to see data (reads from GCS live)
+
+### When to Use Which
+
+| | External Table (query GCS directly) | Native Table (bq load) |
+|:---|:---|:---|
+| **Speed** | Slower — reads from GCS every query | Faster — data in BigQuery columnar storage, optimized |
+| **Storage cost** | Cheaper (GCS rates: ~$0.02/GB/month) | More expensive (BQ rates: ~$0.02/GB/month but also query storage costs) |
+| **Query cost** | More expensive per query (slower scan, more bytes read) | Cheaper per query (columnar format, partitioning, clustering) |
+| **Data freshness** | Always current — reads GCS at query time. New file lands → immediately queryable. | Stale until next `bq load` run |
+| **Use for** | Bronze exploration ("what arrived today?"), ad-hoc investigation, one-time queries | Silver and Gold layers, dashboards, production reports, star schema |
+| **AWS equivalent** | Athena + Glue Catalog querying S3 | Redshift COPY from S3 |
+
+**For our pipeline:** External tables for Bronze (explore, validate). Native tables for Silver and Gold (performance matters for repeated queries and dashboards).
+
+### The GCS Folder Date — How the Pipeline Uses It
+
+The date folders (`2026-04-03/`) are not just organization — the pipeline uses them to process only new data:
+
+```python
+# In the Airflow DAG, {{ ds }} = the execution date
+load_task = GCSToBigQueryOperator(
+    source_objects=['bronze/va_calls/{{ ds }}/*.json'],  # Only today's files
+    ...
+)
+```
+
+Without date folders: the pipeline reprocesses ALL files every run (wasteful at scale).
+With date folders: process only today's new data. Yesterday's data is already in Silver/Gold.
+
+This also enables **reprocessing**: if March 15th's data was wrong, re-run the pipeline for just that date: `bronze/va_calls/2026-03-15/*.json` → re-clean → re-load into Silver/Gold. No other dates are affected.
 
 ### Console UI: External Tables (Alternative — Query GCS Directly)
 
