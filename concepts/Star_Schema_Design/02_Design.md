@@ -1,6 +1,6 @@
 # Star Schema Design — The Tables
 
-**Every table, every column, and which part of the 891-line stored procedure it replaces.**
+**Every dimension table, every fact table, and why each one exists.**
 
 ---
 
@@ -8,19 +8,19 @@
 
 ```mermaid
 graph TD
-    F["fact_calls<br/>───────────────<br/>call_key (PK)<br/>date_key (FK)<br/>time_key (FK)<br/>campaign_key (FK)<br/>agent_key (FK)<br/>disposition_key (FK)<br/>───────────────<br/>call_id (source ref)<br/>call_type (VA/Live)<br/>duration_sec<br/>queue_duration_sec<br/>hold_duration_sec<br/>wrapup_duration_sec<br/>order_id<br/>subtotal<br/>tax<br/>shipping<br/>total<br/>is_order (boolean)<br/>disconnection_reason<br/>caller_ani<br/>caller_state<br/>caller_city"]
+    F["fact_calls<br/>───────────────<br/>call_key (PK)<br/>date_key (FK)<br/>time_key (FK)<br/>campaign_key (FK)<br/>agent_key (FK)<br/>disposition_key (FK)<br/>───────────────<br/>call_id (source ref)<br/>call_type (VA/Live)<br/>duration_sec<br/>queue_duration_sec<br/>order_id<br/>subtotal, tax, shipping, total<br/>is_order (boolean)<br/>caller_ani<br/>caller_state"]
 
-    FA["fact_agent_activity<br/>───────────────<br/>agent_key (FK)<br/>date_key (FK)<br/>time_key (FK)<br/>───────────────<br/>available_time_sec<br/>unavailable_time_sec<br/>total_time_sec<br/>logged_in_time_sec<br/>idle_time_sec"]
+    FA["fact_agent_activity<br/>───────────────<br/>agent_key (FK)<br/>date_key (FK)<br/>time_key (FK)<br/>───────────────<br/>available_time_sec<br/>unavailable_time_sec<br/>logged_in_time_sec<br/>idle_time_sec"]
 
-    D1["dim_date<br/>───────────────<br/>date_key (PK)<br/>full_date<br/>day_name<br/>month_name<br/>quarter<br/>year<br/>fiscal_week<br/>is_weekend<br/>monday_week"]
+    D1["dim_date<br/>date_key, full_date,<br/>day_name, month_name,<br/>quarter, is_weekend"]
 
-    D2["dim_time<br/>───────────────<br/>time_key (PK)<br/>hour (0-23)<br/>half_hour (HH:00/HH:30)<br/>period (Morning/Afternoon/<br/>Evening/Night)<br/>fifteen_min<br/>five_min"]
+    D2["dim_time<br/>time_key, hour,<br/>half_hour, period"]
 
-    D3["dim_campaign<br/>───────────────<br/>campaign_key (PK)<br/>client_name<br/>program_name<br/>campaign_name<br/>dnis<br/>source_name<br/>media_source (buyer)<br/>media_type<br/>buyer_source_code<br/>is_active"]
+    D3["dim_campaign<br/>campaign_key, client_name,<br/>program_name, campaign_name,<br/>dnis, media_source"]
 
-    D4["dim_agent<br/>───────────────<br/>agent_key (PK)<br/>agent_id (source)<br/>agent_name<br/>agent_username<br/>user_extension<br/>supervisor_name<br/>supervisor_id<br/>department<br/>is_va (boolean)"]
+    D4["dim_agent<br/>agent_key, agent_name,<br/>supervisor, department,<br/>is_va"]
 
-    D5["dim_disposition<br/>───────────────<br/>disposition_key (PK)<br/>disposition_type_id<br/>disposition_type<br/>disposition_name<br/>is_sale<br/>is_inquiry<br/>is_abandon<br/>is_junk<br/>is_custsvc"]
+    D5["dim_disposition<br/>disposition_key,<br/>disposition_type,<br/>disposition_name,<br/>is_sale, is_abandon"]
 
     D1 --- F
     D2 --- F
@@ -34,147 +34,186 @@ graph TD
 
 ---
 
-## Dimension Tables — What Each One Replaces
+## Dimension Tables
 
-### dim_date — Replaces Inline Timezone Conversion
+### dim_date — Pre-Computed Calendar
 
-**What the stored proc does today:**
+**Problem it solves:** Every query that filters by date, day of week, month, or weekend/weekday needs to parse a timestamp. Different analysts parse differently. Timezone bugs creep in.
+
+**What it provides:** One row per day, pre-computed. Every query joins on an integer key and gets the day name, month, quarter, weekend flag — without parsing anything.
+
 ```sql
--- Scattered throughout the 891 lines:
-SET @fromDate = @fromDate AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
--- ...later...
-UPDATE #temp21 SET date = va_callstartedat  -- overrides date for VA calls
--- ...later...
-CONVERT(CHAR(10), CAST(DATEADD(HOUR, -4, u.StartedAt) AS date), 101) AS AgentDay
--- Three different timezone approaches in one script
-```
-
-**What dim_date does:**
-```sql
--- Built ONCE by the pipeline. Every date pre-computed.
-
 CREATE TABLE dim_date (
-    date_key        INT PRIMARY KEY,       -- 20260315 (YYYYMMDD integer for fast joins)
+    date_key        INT PRIMARY KEY,          -- 20260315 (YYYYMMDD as integer — fast joins)
     full_date       DATE NOT NULL,
-    full_date_est   DATE NOT NULL,          -- Already converted from UTC to EST
-    day_name        VARCHAR(10),            -- Monday, Tuesday, ...
-    day_of_week     INT,                    -- 1=Sunday, 7=Saturday
-    month_num       INT,
-    month_name      VARCHAR(10),            -- January, February, ...
-    quarter         INT,                    -- 1, 2, 3, 4
-    year            INT,
-    fiscal_week     VARCHAR(10),            -- Monday-start week label
+    day_name        VARCHAR(10),              -- Monday, Tuesday, ...
+    day_of_week_num INT,                      -- 1=Sunday, 7=Saturday
     is_weekend      BOOLEAN,
-    monday_week     DATE                    -- Monday of the week this date falls in
+    monday_week     DATE,                     -- Start of the ISO week (for weekly reports)
+    month_num       INT,
+    month_name      VARCHAR(10),              -- January, February, ...
+    quarter         INT,
+    year            INT
 );
-
--- Populated for the full year: 365 rows. One-time.
--- Timezone conversion happens HERE, not in every query.
 ```
 
-**The bug it prevents:** Bug #2 (UTC vs EST) is impossible. The pipeline converts UTC → EST when populating `dim_date`. Every downstream query uses `full_date_est`. One conversion, one place, always correct.
+**Row count:** 365 (one per day for the year). Built once.
+
+**Timezone:** The pipeline converts UTC → local time when populating this table. Every downstream query uses the correct local date. No `AT TIME ZONE` in any query ever again.
 
 ---
 
-### dim_time — Replaces Inline Hour/Half-Hour Extraction
+### dim_time — Hourly Periods
 
-**What the stored proc does today:**
-```sql
--- The flat table has columns: HourOfDay, Half Hour, 15Minute, 10Minute, 5Minute
--- Plus 48 columns for half-hour call counts (00:00, 00:30, 01:00, 01:30, ...)
--- Plus 48 columns for half-hour order counts
--- That is 96+ columns just for time-of-day breakdowns
-```
+**Problem it solves:** Staffing reports need calls by hour, by half-hour, by period (Morning/Afternoon/Evening/Night). Without this dimension, every query extracts the hour from a timestamp and writes a CASE WHEN for the period.
 
-**What dim_time does:**
+**What it provides:** 24 rows. Join once, get all time breakdowns.
+
 ```sql
 CREATE TABLE dim_time (
-    time_key        INT PRIMARY KEY,        -- 0-23 (hour)
+    time_key        INT PRIMARY KEY,          -- 0-23 (hour of day)
     hour            INT,
-    half_hour       VARCHAR(5),             -- '14:00', '14:30'
-    fifteen_min     VARCHAR(5),             -- '14:00', '14:15', '14:30', '14:45'
-    five_min        VARCHAR(5),
-    period          VARCHAR(10)             -- 'Morning', 'Afternoon', 'Evening', 'Night'
+    half_hour_start VARCHAR(5),               -- '14:00'
+    half_hour_end   VARCHAR(5),               -- '14:30'
+    period          VARCHAR(10)               -- 'Morning', 'Afternoon', 'Evening', 'Night'
 );
-
--- 24 rows. The 96 half-hour columns in the flat table become:
--- GROUP BY dt.half_hour in a query. No extra columns needed.
 ```
 
-**What it eliminates:** 96 columns in the flat table (half-hour call counts + half-hour order counts). A single `GROUP BY dt.half_hour` replaces all of them.
+**What it replaces:** In many legacy systems, time-of-day reports are pre-computed as separate columns — one column per half-hour, one per hour. That is 48-96 columns that a single `GROUP BY dt.hour` replaces.
 
 ---
 
-### dim_campaign — Replaces Hard-Coded Program Name Overrides
+### dim_campaign — Client/Program/DNIS Mapping
 
-**What the stored proc does today:**
-```sql
--- Line 185-189:
-UPDATE t
-SET t.programName = 'Bullseye Pro English'
-FROM #temp21 t
-WHERE t.client = 'Emson' AND t.programName = 'Emson' AND t.va_callid IS NOT NULL;
+**Problem it solves:** The source system stores a DNIS (phone number) on each call. To know which campaign, client, and media source that DNIS maps to, every query joins to a config table. If the mapping changes (client renames a program, a new campaign launches), the source data does not change — but the lookup must reflect the current mapping.
 
--- Line 455-458:
-UPDATE t
-SET t.programName = 'Ellipse Fit English', t.campaignName = 'Ellipse Fit English'
-FROM #temp11 t
-WHERE t.id IN (1094758, 1085870, 1090805);  -- HARD-CODED CALL IDs
-```
+**What it provides:** One row per campaign/DNIS combination. The mapping is **data, not code.** When a campaign name changes, update one row — no query modifications.
 
-**What dim_campaign does:**
 ```sql
 CREATE TABLE dim_campaign (
-    campaign_key        INT PRIMARY KEY,     -- Surrogate key
-    client_name         VARCHAR(100),
-    program_name        VARCHAR(100),        -- The CORRECT name, maintained as data
-    campaign_name       VARCHAR(100),
-    dnis                VARCHAR(20),         -- The phone number that routes to this campaign
-    source_name         VARCHAR(100),
-    media_source        VARCHAR(100),        -- The buyer / media company
-    media_type          VARCHAR(50),         -- TV, Digital, Radio, etc.
-    buyer_source_code   VARCHAR(64),
-    is_active           BOOLEAN
+    campaign_key    INT PRIMARY KEY,          -- Surrogate key (auto-increment)
+    dnis            VARCHAR(20),              -- The phone number
+    client_name     VARCHAR(100),             -- "HealthMax"
+    program_name    VARCHAR(100),             -- "SmartPulse English"
+    campaign_name   VARCHAR(100),             -- "SmartPulse TV Spring"
+    source_name     VARCHAR(100),             -- "SmartPulse TV Spring - MediaBuy Corp"
+    media_source    VARCHAR(100),             -- "MediaBuy Corp" (the buyer)
+    media_type      VARCHAR(50),              -- "TV", "Digital", "Radio"
+    is_active       BOOLEAN
 );
-
--- "Emson" → "Bullseye Pro English" is a row in this table.
--- Not a line of code. If the name changes, update one row.
--- No stored proc modification. No deployment.
 ```
 
-**What it eliminates:** Hard-coded overrides scattered through the stored proc. The mapping is data. When a new client onboards or a program name changes, update the dimension table — not the SQL.
+**Common mistake this prevents:** Hard-coding program name overrides in SQL. In many legacy systems, you see code like `IF client = 'X' THEN set programName = 'Y'`. In the star schema, the correct name is a column in this table. The pipeline reads from this table — not from if/else blocks in code.
 
 ---
 
-### dim_agent — Replaces Agent-Hour CROSS JOIN Expansion
+### dim_agent — Agent Details
 
-**What the stored proc does today (150 lines):**
-```sql
--- Step 8: Create a CROSS JOIN of agents × 24 hours
--- Step 9: FULL OUTER JOIN calls with agent-hours with agent-activity
--- This creates a row for every agent × every hour, even if no call happened
--- Purpose: calculate utilization (available time vs on-call time vs idle time)
-```
+**Problem it solves:** Agent performance reports need to join call data with agent metadata (name, team, supervisor). In source systems, agent data lives in a separate system (the phone platform) with different IDs than the call management system.
 
-**What the star schema does:**
+**What it provides:** One row per agent (including virtual agents). All agent attributes in one place.
+
 ```sql
 CREATE TABLE dim_agent (
-    agent_key           INT PRIMARY KEY,
-    agent_id            INT,                 -- Source system ID
-    agent_name          VARCHAR(100),
-    agent_username      VARCHAR(50),
-    user_extension      VARCHAR(10),
-    supervisor_name     VARCHAR(100),
-    supervisor_id       INT,
-    department          VARCHAR(50),
-    is_va               BOOLEAN              -- TRUE for virtual agents
+    agent_key       INT PRIMARY KEY,
+    agent_id        INT,                      -- Source system ID
+    agent_name      VARCHAR(100),
+    agent_username  VARCHAR(50),
+    user_extension  VARCHAR(10),
+    supervisor_name VARCHAR(100),
+    supervisor_id   INT,
+    department      VARCHAR(50),
+    is_va           BOOLEAN                   -- TRUE for virtual agent entries
 );
+```
 
--- Agent TIME data goes in a separate fact table:
+---
+
+### dim_disposition — Outcome Lookup
+
+**Problem it solves:** Call outcomes are stored as codes in source systems — integer IDs, failure reason codes, status codes. Reports need human-readable names: "Order", "Abandoned", "Customer Service", "Junk." The mapping from code to name lives in lookup tables — or worse, in CASE WHEN statements in queries.
+
+**What it provides:** One row per disposition combination. The mapping is data.
+
+```sql
+CREATE TABLE dim_disposition (
+    disposition_key INT PRIMARY KEY,
+    disposition_type VARCHAR(50),             -- Internal category: "sale", "abandon", "inquiry"
+    disposition_name VARCHAR(50),             -- Display name: "ORDER", "ABANDON", "IVR"
+    is_sale         BOOLEAN,
+    is_inquiry      BOOLEAN,
+    is_abandon      BOOLEAN,
+    is_junk         BOOLEAN,
+    is_custsvc      BOOLEAN
+);
+```
+
+**What it replaces:** In legacy systems, disposition mapping is often 20-50 lines of CASE WHEN logic embedded in a stored procedure or a reporting query. Every time a new disposition is added, the CASE WHEN block must be updated and redeployed. In the star schema, adding a new disposition is an INSERT into this table.
+
+---
+
+## Fact Tables
+
+### fact_calls — One Row Per Call
+
+The center of the star. Contains measures (duration, revenue) and foreign keys to every dimension.
+
+```sql
+CREATE TABLE fact_calls (
+    -- Surrogate key
+    call_key            INT PRIMARY KEY,
+
+    -- Dimension keys (integer — fast joins)
+    date_key            INT REFERENCES dim_date,
+    time_key            INT REFERENCES dim_time,
+    campaign_key        INT REFERENCES dim_campaign,
+    agent_key           INT REFERENCES dim_agent,
+    disposition_key     INT REFERENCES dim_disposition,
+
+    -- Source reference (for tracing back to original systems)
+    call_id             VARCHAR(100),
+    call_type           VARCHAR(10),         -- 'VA' or 'Live'
+    call_date           DATE,                -- For partitioning
+
+    -- Measures
+    duration_sec        INT,
+    queue_duration_sec  INT,
+    hold_duration_sec   INT,
+    wrapup_duration_sec INT,
+
+    -- Order data (denormalized for convenience — not every call has an order)
+    order_id            INT,
+    subtotal            DECIMAL(10,2),
+    tax                 DECIMAL(10,2),
+    shipping            DECIMAL(10,2),
+    total               DECIMAL(10,2),
+    is_order            BOOLEAN,
+
+    -- Caller metadata
+    disconnection_reason VARCHAR(50),
+    caller_ani          VARCHAR(20),
+    caller_state        VARCHAR(10),
+    caller_city         VARCHAR(50)
+);
+```
+
+**Key design decisions:**
+
+- **One row per call.** VA and Live agent calls are combined. `call_type` column distinguishes them. No UNION needed at query time.
+- **Order data denormalized into the fact.** This is intentional. Most reports need revenue alongside call data. Pre-joining order totals into the fact table avoids an extra join in every query. If line-item detail is needed (which products were sold), join to the `order_details` source table using `order_id`.
+- **Partitioned by `call_date`.** BigQuery/Redshift scans only the date range in the WHERE clause instead of the entire table.
+- **Clustered by `campaign_key`.** Queries filtered by campaign skip irrelevant data blocks.
+- **Unique per call.** The pipeline deduplicates in Silver. The fact table never has duplicates.
+
+### fact_agent_activity — Agent Time Tracking
+
+A separate fact table for agent utilization. This data has a different grain (one row per agent per hour) than `fact_calls` (one row per call).
+
+```sql
 CREATE TABLE fact_agent_activity (
     agent_key           INT REFERENCES dim_agent,
     date_key            INT REFERENCES dim_date,
-    time_key            INT REFERENCES dim_time,
+    time_key            INT REFERENCES dim_time,     -- hour
     available_time_sec  INT,
     unavailable_time_sec INT,
     total_time_sec      INT,
@@ -183,103 +222,7 @@ CREATE TABLE fact_agent_activity (
 );
 ```
 
-**What it eliminates:** The CROSS JOIN expansion and FULL OUTER JOIN in the stored proc. Agent activity is a separate fact table — join it to `fact_calls` when needed for utilization reports, ignore it otherwise. The 150 lines of agent-time logic become a simple pipeline step that populates `fact_agent_activity`.
-
----
-
-### dim_disposition — Replaces 50 Lines of CASE WHEN
-
-**What the stored proc does today:**
-```sql
--- Lines 391-432:
-UPDATE t SET
-    t.DispoType = CASE
-        WHEN t.FailReason = 10001 AND t.status = 9  THEN 'failed_unknown_status_9'
-        WHEN t.FailReason = 11001 AND t.status = 9  THEN 'connection_time_out'
-        WHEN t.FailReason = 20003 AND t.status = 9  THEN 'eu_abandoned'
-        -- ... 15 more WHEN clauses ...
-    END,
-    t.DispoName = CASE
-        WHEN t.FailReason = 10001 AND t.status = 9  THEN 'ABANDON'
-        WHEN t.FailReason = 11001 AND t.status = 9  THEN 'ABANDON'
-        -- ... 15 more WHEN clauses ...
-    END
-```
-
-**What dim_disposition does:**
-```sql
-CREATE TABLE dim_disposition (
-    disposition_key     INT PRIMARY KEY,
-    fail_reason         INT,
-    status              INT,
-    disposition_type    VARCHAR(50),          -- 'eu_abandoned', 'connection_time_out', etc.
-    disposition_name    VARCHAR(20),          -- 'ABANDON', 'ORDER', 'IVR', etc.
-    is_sale             BOOLEAN,
-    is_inquiry          BOOLEAN,
-    is_abandon          BOOLEAN,
-    is_junk             BOOLEAN,
-    is_custsvc          BOOLEAN
-);
-
--- The 50-line CASE WHEN becomes a lookup table:
--- INSERT INTO dim_disposition VALUES (1, 10001, 9, 'failed_unknown_status_9', 'ABANDON', false, false, true, false, false);
--- INSERT INTO dim_disposition VALUES (2, 11001, 9, 'connection_time_out', 'ABANDON', false, false, true, false, false);
--- ...
-
--- In the pipeline:
--- fact_calls.disposition_key = dim_disposition.disposition_key
--- (matched by fail_reason + status during Gold layer build)
-```
-
-**What it eliminates:** 50 lines of CASE WHEN logic. Adding a new disposition type is an INSERT, not a code change.
-
----
-
-## The Fact Table — What It Contains
-
-```sql
-CREATE TABLE fact_calls (
-    -- Keys
-    call_key            INT PRIMARY KEY,     -- Surrogate key
-    date_key            INT REFERENCES dim_date,
-    time_key            INT REFERENCES dim_time,
-    campaign_key        INT REFERENCES dim_campaign,
-    agent_key           INT REFERENCES dim_agent,
-    disposition_key     INT REFERENCES dim_disposition,
-
-    -- Source reference (for tracing back to original systems)
-    call_id             VARCHAR(100),        -- Original call_id (from TSN_VA_Calls or tblCall)
-    voiceprint_id       VARCHAR(50),         -- tblCall.VoicePrintID
-    call_type           VARCHAR(10),         -- 'VA' or 'Live'
-
-    -- Measures
-    duration_sec        INT,
-    queue_duration_sec  INT,
-    hold_duration_sec   INT,
-    wrapup_duration_sec INT,
-
-    -- Order data (denormalized for query convenience)
-    order_id            INT,
-    subtotal            DECIMAL(10,2),
-    tax                 DECIMAL(10,2),
-    shipping            DECIMAL(10,2),
-    total               DECIMAL(10,2),
-    is_order            BOOLEAN,             -- TRUE if disposition is a sale
-
-    -- Call metadata
-    disconnection_reason VARCHAR(50),
-    caller_ani          VARCHAR(20),
-    caller_state        VARCHAR(10),
-    caller_city         VARCHAR(50)
-);
-```
-
-**One row per call.** Unique on `call_key`. No duplicates by design — the Silver layer deduplicates, and the surrogate key is generated by the pipeline.
-
-**315 columns → ~25 columns.** The other 290 columns in the flat table are either:
-- Dimension attributes (now in dimension tables, joined when needed)
-- Time-bucketed aggregations (now computed at query time via GROUP BY)
-- Agent activity metrics (now in `fact_agent_activity`)
+**Why separate?** In legacy systems, agent time is often forced into the same table as call data — creating a row for every agent × every hour via CROSS JOIN, even when no calls happened. That inflates the table and makes call-level queries complex. Separating agent activity into its own fact table keeps `fact_calls` clean. Join them when needed for utilization reports.
 
 ---
 
@@ -287,32 +230,33 @@ CREATE TABLE fact_calls (
 
 ```mermaid
 graph LR
-    A["Bronze<br/>Raw data from<br/>7 source systems"] --> B["Silver<br/>Dedup, timezone fix,<br/>type casting, null flagging"]
-    B --> C["Gold: Dimensions<br/>dim_date, dim_campaign,<br/>dim_agent, dim_disposition<br/>(business logic as DATA)"]
-    B --> D["Gold: Facts<br/>fact_calls, fact_agent_activity<br/>(surrogate keys, clean measures)"]
-    C --> E["Queries<br/>Simple joins on<br/>integer keys"]
+    A["Bronze<br/>Raw data from<br/>source systems"] --> B["Silver<br/>Dedup, timezone,<br/>type casting,<br/>null flagging"]
+    B --> C["Gold: Dimensions<br/>dim_date, dim_campaign,<br/>dim_agent, dim_disposition<br/>(business logic as data)"]
+    B --> D["Gold: Facts<br/>fact_calls<br/>fact_agent_activity<br/>(surrogate keys,<br/>clean measures)"]
+    C --> E["Queries &<br/>Dashboards"]
     D --> E
 ```
 
-Each step is independent. The Silver pipeline can run without the Gold pipeline. The Gold pipeline can run without the queries. A bug in one layer is isolated — it does not cascade through 891 lines.
+Each layer is independent:
+- Silver can run without Gold
+- Gold can run without queries
+- A bug in one layer is isolated — not cascading through hundreds of lines
 
 ---
 
-## The Comparison Table
+## Summary
 
-| Aspect | 891-Line Stored Proc | Star Schema |
+| Component | Rows | Purpose |
 |:---|:---|:---|
-| **Lines of SQL** | 891 | ~100 (pipeline) + ~50 (table DDL) |
-| **Columns per row** | 315 | ~25 (fact) + dimensions joined when needed |
-| **Timezone handling** | 3 different approaches in one script | One conversion in Silver, used everywhere |
-| **Dedup** | Analyst must remember. Duplicates exist. | Unique key on fact table. Impossible by design. |
-| **Disposition mapping** | 50 lines of CASE WHEN | Lookup table. One INSERT per new type. |
-| **Program name overrides** | Hard-coded in SQL | Data in dim_campaign. Update a row. |
-| **Agent utilization** | 150-line CROSS JOIN expansion | Separate fact table. Join when needed. |
-| **Adding a new report field** | Modify stored proc. Test. Deploy. Pray. | Add column to one dimension. Or add to the query. |
-| **Finding a bug** | Read 891 lines. Trace through 10 temp tables. | Check: is it in Silver (cleaning)? Gold (business logic)? Query? Three places. |
-| **Onboarding a new developer** | "Read the stored proc. Good luck." | "Bronze is raw. Silver is clean. Gold is modeled. Query the star schema." |
+| dim_date | 365 | Calendar lookup — day name, weekend, month, quarter |
+| dim_time | 24 | Hour → period (Morning/Afternoon/Evening/Night) |
+| dim_campaign | ~10-50 | DNIS → client, campaign, media source mapping |
+| dim_disposition | ~10-20 | Outcome code → human-readable name + boolean flags |
+| dim_agent | ~10-100 | Agent details, supervisor, VA flag |
+| **fact_calls** | **~thousands-millions** | **One row per call. Measures + dimension keys.** |
+| fact_agent_activity | ~agents × hours | Agent utilization per hour |
 
 ---
 
-**Next:** [03 — Building It](03_Building_It.md) — How to build this star schema on BigQuery, step by step, from the call center data.
+**Next:** [02a — The Source Tables](02a_Source_Tables.md) — What the source tables look like before the star schema.
+**Then:** [03 — Building It](03_Building_It.md) — Build this star schema on BigQuery, step by step.

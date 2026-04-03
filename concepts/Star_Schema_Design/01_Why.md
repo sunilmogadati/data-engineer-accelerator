@@ -2,54 +2,125 @@
 
 ---
 
-## The 891-Line Stored Procedure
+## The Question Every Data Engineer Gets Asked
 
-A real production call center has a reporting system. The system generates a report table — one massive flat table with 315 columns — by running a stored procedure that is 891 lines of SQL.
+"The data is already in the database. Why can't we just query it?"
 
-That stored procedure does 10 things in one script:
+The VP wants to know: conversion rate by campaign by hour for March. The data exists. The call records are in one table. The campaigns are in another. The orders are in a third. Just join them and GROUP BY, right?
 
-1. Unions two different source tables (live agent calls + virtual agent calls) with complex dedup logic to avoid double-counting
-2. Patches date fields (overrides one date column with values from another)
-3. Hard-codes program name overrides ("Emson" → "Bullseye Pro English") for specific clients
-4. Filters training calls from real calls using a phone number lookup table
-5. Joins order data (finds the latest order per call, pulls revenue/tax/shipping)
-6. Maps 15+ failure reason codes to human-readable disposition names using 50 lines of CASE WHEN statements
-7. Normalizes deflection messages (converts internal codes to labels)
-8. Expands agent time data using a CROSS JOIN of agents × 24 hours — creating rows for every possible agent-hour combination
-9. Merges calls + agent hours + agent activity into one giant temp table using FULL OUTER JOINs
-10. Applies client-specific revenue overrides (one client gets revenue from table A, another from table B)
+Here is what that looks like in practice:
 
-The result: 315 columns per row. Every possible reporting field pre-joined into one flat structure.
+```sql
+-- "Conversion rate by campaign by hour for March"
+-- Querying source tables directly:
+
+SELECT
+    ds.campaign_name,
+    ds.media_source,
+    EXTRACT(HOUR FROM va.call_started_at AT TIME ZONE 'UTC' AT TIME ZONE 'US/Eastern') AS hour_est,
+    COUNT(DISTINCT va.call_id) AS total_calls,
+    COUNT(DISTINCT o.order_id) AS orders,
+    ROUND(COUNT(DISTINCT o.order_id) * 100.0 / NULLIF(COUNT(DISTINCT va.call_id), 0), 1) AS conversion_pct
+FROM va_calls va
+JOIN dnis_sources ds ON va.dnis = ds.dnis
+LEFT JOIN calls c ON c.voiceprint_id = va.call_id
+LEFT JOIN orders o ON o.voiceprint_id = va.call_id
+LEFT JOIN order_details od ON od.order_id = o.order_id
+WHERE va.call_started_at AT TIME ZONE 'UTC' AT TIME ZONE 'US/Eastern'
+    BETWEEN '2026-03-01' AND '2026-03-31 23:59:59'
+AND va.disposition NOT IN ('test', 'junk')
+AND va.channel = 'VA'
+GROUP BY ds.campaign_name, ds.media_source, hour_est
+ORDER BY ds.campaign_name, hour_est;
+```
+
+It works. And it has seven problems.
 
 ---
 
-## The Bugs This Approach Creates
+## The Seven Problems With Querying Source Tables Directly
 
-This system has known bugs that have been pending fixes for months:
+### Problem 1: Every Analyst Writes the Same Complex Joins
 
-**Bug 1: Wrong date field.** The stored procedure populates `va_callstartedat` from `callendedat` instead of `callstartedat`. Every VA call shows the wrong start time. The fix is changing one word in two SQL files — but finding WHERE the wrong value comes from requires tracing through 891 lines of temp table manipulations.
+The query above has 5 joins. Every analyst who wants campaign data must write the same join chain: `va_calls → dnis_sources → calls → orders → order_details`. Miss one join → wrong numbers. Use the wrong join key → silent data loss. Ten analysts writing this independently will write it ten different ways.
 
-**Bug 2: Timezone display.** Reports show dates in UTC instead of Eastern Standard Time. A call made at 9 PM EST on March 2nd shows as March 3rd in the report (because 9 PM EST = 2 AM UTC the next day). The timezone conversion exists in the stored proc — but it is applied inconsistently across the 10 steps.
+### Problem 2: Different Systems, Different IDs for the Same Thing
 
-**Bug 3: Duplicate rows.** The flat table has duplicate rows for some calls. The UNION + FULL OUTER JOIN logic in steps 1 and 9 creates them. Every downstream query must dedup, and every analyst must know about this.
+The VA platform calls it `call_id`. The call management system calls it `voiceprint_id`. The order system links on `voiceprint_id` too, but sometimes it is UPPERCASED. The phone config table uses `dnis` as a string in one system and an integer in another.
 
-None of these bugs are hard to fix in isolation. They are hard to find because **the logic is tangled.** Cleaning, business rules, joins, overrides, and reporting are all in one script. A change on line 185 affects the output on line 800 in ways that require reading the entire procedure to understand.
+Every join must account for these differences. A new developer does not know that `calls.voiceprint_id` links to `va_calls.call_id`. There is no foreign key constraint. There is no documentation. It is tribal knowledge.
+
+### Problem 3: Timezone Conversion in Every Query
+
+Timestamps are stored in UTC (Coordinated Universal Time). Reports need Eastern Standard Time. That means every query includes:
+
+```sql
+AT TIME ZONE 'UTC' AT TIME ZONE 'US/Eastern'
+```
+
+Forget it in one query → March 3rd shows 200 calls instead of 180 (because late-night EST calls spill into the next UTC day). Two analysts using different timezone approaches → two different numbers for the same report.
+
+### Problem 4: No Dedup
+
+Source systems sometimes record the same call twice — a webhook fires twice, an import runs twice, a retry creates a duplicate. The source tables have no unique constraint that prevents this. Every query must either use `DISTINCT` (which can mask real issues) or the analyst must know which duplicates to expect and handle them.
+
+### Problem 5: VA and Live Agent Data Have Different Schemas
+
+VA calls are in `va_calls` with columns like `summary`, `sentiment`, `disconnection_reason`. Live agent calls are in `calls` with columns like `CallDispositionID`, `Revenue`, `CallEndTime`. Combining them requires a UNION with careful column mapping — and the columns do not line up 1:1.
+
+Every report that needs "all calls" must write this UNION. Every report that needs "VA only" or "Live only" must filter. The logic is repeated in every query.
+
+### Problem 6: Revenue Comes From Different Places
+
+For most calls, revenue is in the `orders` table. But some clients store revenue differently — a third-party fulfillment system, a linked fields table, a separate API. The analyst must know which client uses which revenue source. This is business logic embedded in query-time decisions.
+
+### Problem 7: Every New Question Starts From Scratch
+
+"Add day-of-week to the report" → parse the timestamp, extract the day, add it to the GROUP BY. "Add media source" → join another table. "Filter out test calls" → add a WHERE clause based on a phone number lookup table. Every new question requires modifying the same complex query, and every modification risks breaking something.
 
 ---
 
-## What a Star Schema Solves
+## What a Star Schema Does
 
-The star schema separates concerns:
+A star schema separates the concerns:
 
-| Concern | Flat Table Approach | Star Schema Approach |
+| Concern | Where It Is Handled | When It Runs |
 |:---|:---|:---|
-| **Data cleaning** (dedup, timezone, null handling) | Mixed into the stored proc alongside business logic | Handled once in the **Silver layer** pipeline. Downstream tables are already clean. |
-| **Business logic** (disposition mapping, program name overrides, client-specific revenue) | 50 lines of CASE WHEN, hard-coded call IDs, client IF/ELSE blocks | Stored in **dimension tables**. The mapping is data, not code. Change a dimension row, not a stored proc. |
-| **Report generation** (agent hours, cross joins, final SELECT) | Part of the same 891-line script | Queries run against the star schema at runtime. Simple GROUP BY with integer key joins. |
+| **Data cleaning** (dedup, timezone, null handling, type casting) | Silver layer pipeline | Once, when data arrives |
+| **Business logic** (disposition mapping, program name overrides, revenue source routing) | Dimension tables (data, not code) | Once, maintained as reference data |
+| **Joining data from multiple systems** | Gold layer pipeline (builds the fact table) | Once, when pipeline runs |
+| **Answering business questions** | Queries against the star schema | Every time someone asks a question |
 
-When Bug 1 happens in a star schema world: the timezone conversion lives in exactly one place — the Silver→Gold pipeline that populates `dim_date`. Fix it there, every downstream query is correct. No tracing through 891 lines.
+The same query — "conversion rate by campaign by hour for March" — on the star schema:
 
-When Bug 3 happens: the dedup logic lives in the Silver layer. The fact table has a unique constraint on `call_key`. Duplicates are impossible by design. No analyst needs to remember to dedup.
+```sql
+SELECT
+    dc.campaign_name,
+    dc.media_source,
+    dt.hour,
+    COUNT(*) AS total_calls,
+    COUNTIF(f.is_order) AS orders,
+    ROUND(COUNTIF(f.is_order) / COUNT(*) * 100, 1) AS conversion_pct
+FROM fact_calls f
+JOIN dim_campaign dc ON f.campaign_key = dc.campaign_key
+JOIN dim_date dd ON f.date_key = dd.date_key
+JOIN dim_time dt ON f.time_key = dt.time_key
+WHERE dd.month_name = 'March'
+GROUP BY dc.campaign_name, dc.media_source, dt.hour
+ORDER BY dc.campaign_name, dt.hour;
+```
+
+### What Changed
+
+| Problem | Source Tables | Star Schema |
+|:---|:---|:---|
+| **Complex joins** | 5 joins on string keys across different systems | 3 joins on integer keys, same pattern every time |
+| **Different IDs** | `call_id` vs `voiceprint_id` vs `CallID` | `campaign_key`, `date_key` — integer, consistent |
+| **Timezone** | Inline `AT TIME ZONE` in every query | Converted once in the pipeline. `dim_date` has the correct local date. |
+| **Duplicates** | Must dedup in every query | Deduped in the pipeline. `fact_calls` has one row per call by design. |
+| **VA + Live** | UNION with column mapping | Already combined in `fact_calls`. Column `call_type` distinguishes them. |
+| **Revenue source** | Analyst must know client-specific logic | Pipeline handles it. `fact_calls.total` has the correct revenue regardless of source. |
+| **New questions** | Rewrite from scratch | Add a dimension column to GROUP BY. Same base query. |
 
 ---
 
@@ -57,34 +128,49 @@ When Bug 3 happens: the dedup logic lives in the Silver layer. The fact table ha
 
 ```mermaid
 graph TD
-    subgraph "Current: Flat Table (891-line stored proc)"
-        A["tblCustomReportBaseQueryResult<br/>(live calls)"] --> SP["Stored Procedure<br/>891 lines<br/>cleaning + business logic +<br/>joins + overrides + reporting<br/>ALL MIXED TOGETHER"]
-        B["tblCustomReportBaseQueryResult_VA<br/>(VA calls)"] --> SP
-        C["Orders, tblCall, tblSource,<br/>Ujet_UserActivityLogs, ..."] --> SP
-        SP --> FLAT["Flat Table<br/>315 columns<br/>duplicates, wrong dates, tangled logic"]
+    subgraph "Source Systems (operational, many formats)"
+        S1["VA Platform<br/>(JSON/API)"]
+        S2["Call Management<br/>(SQL)"]
+        S3["Orders<br/>(SQL)"]
+        S4["Payments<br/>(SQL)"]
+        S5["DNIS Config<br/>(SQL)"]
     end
 
-    subgraph "Proposed: Star Schema (layered pipeline)"
-        A2["Source Tables<br/>(same sources)"] --> BRONZE["Bronze<br/>Raw data, untouched"]
-        BRONZE --> SILVER["Silver<br/>Cleaned: dedup, timezone,<br/>types, nulls flagged<br/>(ONE PLACE for all cleaning)"]
-        SILVER --> DIM["Dimension Tables<br/>dim_date, dim_campaign,<br/>dim_agent, dim_disposition<br/>(business logic is DATA,<br/>not code)"]
-        SILVER --> FACT["Fact Tables<br/>fact_calls (~15 cols)<br/>fact_agent_activity<br/>(unique key, no duplicates)"]
-        DIM --> QUERY["Queries<br/>Simple GROUP BY<br/>integer key joins<br/>no cleaning needed"]
-        FACT --> QUERY
+    subgraph "Pipeline (runs once per batch)"
+        S1 --> B["Bronze<br/>Raw data, untouched"]
+        S2 --> B
+        S3 --> B
+        S4 --> B
+        S5 --> B
+        B --> SV["Silver<br/>Dedup, timezone,<br/>type fix, null flag"]
+        SV --> G["Gold<br/>Star schema:<br/>fact_calls + dimensions"]
+    end
+
+    subgraph "Consumers (run every time someone asks a question)"
+        G --> Q1["Report: Campaign Performance"]
+        G --> Q2["Report: Hourly Volume"]
+        G --> Q3["Report: Revenue by Client"]
+        G --> Q4["Dashboard: Looker Studio"]
+        G --> Q5["ML: Feature extraction"]
     end
 ```
 
+The complexity lives in the pipeline (runs once, maintained by the data engineering team). The queries are simple (run many times, written by anyone).
+
 ---
 
-## What This Means Practically
+## The Common Objection: "But It Is Just More Tables"
 
-| Scenario | Flat Table | Star Schema |
+Yes — a star schema has more tables than querying the sources directly. But the question is not "how many tables" — it is "where does the complexity live?"
+
+| Approach | Complexity Location | Who Bears It |
 |:---|:---|:---|
-| "Add a new media source report" | Modify the stored proc to add columns. Hope it does not break the existing 315. Redeploy. | Add a column to `dim_campaign`. No stored proc changes. No redeployment. |
-| "Why does March 3rd show 200 calls but the VA dashboard shows 180?" | Trace through 891 lines to find which step miscounts. Is it the dedup? The timezone? The UNION? The FULL OUTER JOIN? | Check: is the fact table count correct? (If yes, the query is wrong. If no, the Silver pipeline has a bug.) Two places to look, not 891 lines. |
-| "We signed a new client. Add their custom revenue logic." | Add another client-specific IF block to the stored proc. It is now 920 lines. | Add the client to `dim_campaign`. If their revenue comes from a different source, add a config row to a revenue-source mapping table. The pipeline handles it. |
-| "The CEO asks for conversion rate by media source by hour by day of week" | The flat table has these columns but the analyst must know: use `HourOfDay` (not `Hour`), filter out `FailReason NOT IN (10001, ...)`, dedup by `id`, handle VA separately. | `SELECT dc.media_source, dd.day_name, dt.hour, COUNT(CASE WHEN f.is_order THEN 1 END) / COUNT(*) FROM fact_calls f JOIN dim_campaign dc ... JOIN dim_date dd ... JOIN dim_time dt ... GROUP BY ...` |
+| Query source tables | In every query, every time | Every analyst, every developer, every report |
+| Star schema | In the pipeline, once | The data engineering team, one time |
+
+One team absorbs the complexity once. Everyone else gets simple, reliable queries forever. That is the tradeoff — and it is the right one.
 
 ---
 
-**Next:** [02 — The Star Schema Design](02_Design.md) — The actual table structures, column definitions, and how each dimension replaces a section of the stored procedure.
+**Next:** [02 — The Star Schema Design](02_Design.md) — The actual dimension and fact table structures.
+**Also:** [02a — The Source Tables](02a_Source_Tables.md) — What the source tables look like and how they relate to each other.
