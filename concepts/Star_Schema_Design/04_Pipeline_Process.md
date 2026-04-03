@@ -379,13 +379,42 @@ BigQuery can query files in GCS without loading them first — **external tables
 4. Table type: **External table** (not native — data stays in GCS)
 5. This avoids the load step for ad-hoc exploration, but is slower for repeated queries
 
-### Silver Transformation: Clean and Unify
+---
+
+## Step 2: CLEAN — Bronze → Silver (BigQuery)
+
+**Goal:** Transform raw data into clean, reliable, unified tables. Silver is the **single source of truth** for all downstream consumers.
+
+### What Silver Does (and Does NOT Do)
+
+| Silver DOES | Silver Does NOT |
+|:---|:---|
+| Remove duplicate records | Drop records with missing values (that is a Gold-layer decision) |
+| Convert timezones (UTC → local) | Join to dimension tables (that is Gold) |
+| Fix data types (strings → dates, numbers) | Create surrogate keys (that is Gold) |
+| Standardize text (trim whitespace, consistent casing) | Aggregate or summarize (that is Gold) |
+| Flatten nested JSON (MongoDB documents → flat columns) | Apply business rules like "Emson = Bullseye Pro" (that is Gold dimensions) |
+| Flag missing values (boolean columns: `has_missing_X`) | Filter records for specific consumers (that is Gold) |
+| Union multiple sources into one table (VA + Live → `silver.calls`) | Build the star schema (that is Gold) |
+
+**The principle:** Silver is **source-agnostic** and **consumer-agnostic.** It does not know about campaigns, dimensions, or star schemas. It only knows: "is this record clean, deduplicated, and correctly typed?" Anyone — analytics, ML, APIs — can read from Silver and trust the data.
+
+### Silver Tables
+
+| Silver Table | Built From | What It Contains |
+|:---|:---|:---|
+| `silver.calls` | `raw.va_calls` + `raw.calls` | One row per call (deduped), timestamps in local time, VA + Live unified, nulls flagged |
+| `silver.orders` | `raw.orders` | One row per order (deduped), types fixed |
+| `silver.payments` | `raw.payments` | One row per payment attempt, status standardized |
+| `silver.dnis_sources` | `raw.dnis_sources` | Validated config — no orphan DNIS, active flag checked |
+
+### Silver SQL
 
 ```sql
 -- Create Silver dataset
 CREATE SCHEMA IF NOT EXISTS silver OPTIONS (location = 'us-central1');
 
--- Silver calls: dedup, timezone, type fix, union VA + Live, flag nulls
+-- silver.calls: dedup, timezone, type fix, union VA + Live, flag nulls
 CREATE OR REPLACE TABLE silver.calls AS
 
 WITH va_cleaned AS (
@@ -447,23 +476,66 @@ FROM silver.calls;
 
 ---
 
-## Step 3: MODEL — Silver → Gold Dimensions (BigQuery)
+## Step 3: MODEL — Build Gold Dimensions (BigQuery)
 
-**Goal:** Build the dimension tables that provide context to the fact table.
+**Goal:** Build the **context tables** (dimensions) that give meaning to the raw numbers. This is where business logic lives — as data, not code.
+
+### What Gold Dimensions Do (and How They Differ from Silver)
+
+| Silver | Gold Dimensions |
+|:---|:---|
+| Knows about data quality: "is this record clean?" | Knows about business meaning: "what campaign is DNIS 8005550101?" |
+| Source-agnostic: does not know what a "campaign" is | Business-aware: `dim_campaign` maps DNIS → client → program → media source |
+| Changes every pipeline run (new data arrives) | Changes rarely (new campaign launches, new disposition type added) |
+| One table per source system (calls, orders, payments) | One table per business concept (date, time, campaign, agent, disposition) |
+
+### The Dimensions
+
+| Dimension | What It Provides | How Often It Changes | Example |
+|:---|:---|:---|:---|
+| `dim_date` | Calendar attributes: day name, weekend flag, month, quarter | Built once for the year (365 rows) | "Is 2026-04-03 a weekend?" → No, it's Thursday |
+| `dim_time` | Hourly periods: Morning, Afternoon, Evening, Night | Built once (24 rows) | "What period is hour 19?" → Evening |
+| `dim_campaign` | DNIS → client, program, campaign, media source | When a new campaign launches or a mapping changes | "What campaign is DNIS 8005550101?" → SmartPulse TV Spring, HealthMax, MediaBuy Corp |
+| `dim_disposition` | Outcome codes → human names + boolean flags | When a new outcome type is added | "What is disposition type 'completed'?" → Sale, is_sale=true |
+| `dim_agent` | Agent details, supervisor, team, VA flag | When agents are hired/leave/change teams | "Who is agent 101?" → Sarah Chen, Sales Team A, Senior |
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS gold OPTIONS (location = 'us-central1');
 ```
 
-The dimension CREATE TABLE statements are in [03_Building_It.md](03_Building_It.md) — `dim_date`, `dim_time`, `dim_campaign`, `dim_disposition`. Run them in this step.
+The full dimension CREATE TABLE statements with SQL are in [03_Building_It.md](03_Building_It.md). Run them in this step.
 
-**Key point:** Dimensions are mostly static or slowly changing. `dim_date` is built once for the year. `dim_campaign` changes when a new campaign launches. `dim_disposition` changes when a new outcome type is added. These are not rebuilt nightly — they are maintained as reference data.
+**Key point:** Dimensions are NOT rebuilt nightly (unlike Silver and the fact table). They are **reference data** — maintained when the business changes, not when new call data arrives. A new campaign? INSERT a row into `dim_campaign`. A new disposition type? INSERT a row into `dim_disposition`. No pipeline re-run needed.
 
 ---
 
 ## Step 4: LOAD — Silver + Dimensions → Gold Facts (BigQuery)
 
-**Goal:** Build the fact table by joining Silver data to dimension keys.
+**Goal:** Build the **fact table** — the center of the star schema. This is where Silver data (clean records) meets Gold dimensions (business context) to produce the final analytical table.
+
+### What the Fact Table Does (and How It Differs from Silver and Dimensions)
+
+| Silver | Gold Dimensions | Gold Fact Table |
+|:---|:---|:---|
+| Clean records — one row per call | Context — one row per campaign/date/agent | **Analytical table — one row per call, enriched with dimension keys** |
+| No business context (just `dnis`, not "which campaign") | Business context (maps DNIS → campaign) | Combines both: each call row has `campaign_key`, `date_key`, `disposition_key` |
+| String joins (`dnis = '8005550101'`) | Surrogate integer keys (`campaign_key = 7`) | Integer key joins — fast, consistent |
+| Rebuilt nightly (full or incremental) | Maintained as reference data | Rebuilt nightly from Silver + dimensions |
+| Input to Gold | Input to Gold | **Output of Gold — what everyone queries** |
+
+### How the Fact Table Is Built
+
+```
+Silver (clean call records)
+    +
+Gold Dimensions (campaign, date, disposition lookups)
+    =
+Gold Fact Table (call records enriched with integer dimension keys)
+```
+
+The fact table is a **JOIN** — Silver records matched to dimension keys. A call with `dnis = '8005550101'` gets matched to `dim_campaign` where `dnis = '8005550101'` → `campaign_key = 7`. Now every query joins on `campaign_key = 7` (integer) instead of `dnis = '8005550101'` (string).
+
+### The SQL
 
 ```sql
 CREATE OR REPLACE TABLE gold.fact_calls
@@ -503,6 +575,36 @@ LEFT JOIN gold.dim_campaign dc ON s.dnis = dc.dnis
 LEFT JOIN gold.dim_disposition dd ON s.disposition = LOWER(dd.disposition_name)
 LEFT JOIN silver.orders o ON s.call_id = o.call_id;
 ```
+
+---
+
+### The Clear Separation — Why Three Steps, Not One
+
+```mermaid
+graph TD
+    subgraph "Step 2: SILVER — data cleaning"
+        S["silver.calls, silver.orders<br/>──────────────────<br/>Dedup, Timezone, Types,<br/>Nulls flagged, Sources unified<br/>──────────────────<br/>NO business logic<br/>NO dimension keys"]
+    end
+
+    subgraph "Step 3: GOLD DIMENSIONS — business context"
+        D["dim_date, dim_time,<br/>dim_campaign, dim_disposition<br/>──────────────────<br/>Business mappings,<br/>Surrogate keys,<br/>Human-readable names<br/>──────────────────<br/>NOT rebuilt nightly"]
+    end
+
+    subgraph "Step 4: GOLD FACTS — the join"
+        F["fact_calls<br/>──────────────────<br/>Silver records +<br/>dimension keys =<br/>analytical table<br/>──────────────────<br/>Rebuilt nightly"]
+    end
+
+    S -->|"clean records"| F
+    D -->|"integer keys"| F
+```
+
+**Why not do it all in one step?**
+
+- If cleaning logic has a bug → fix Silver only. Dimensions and fact table structure are unaffected.
+- If a campaign mapping changes → update `dim_campaign` only. Silver is unaffected. Fact table re-runs with the new mapping.
+- If the fact table join is wrong → fix the join query. Silver data and dimensions are untouched.
+
+**Each layer has ONE job.** Silver cleans. Dimensions provide context. Facts join them together. A problem in one layer does not cascade to the others.
 
 ---
 
